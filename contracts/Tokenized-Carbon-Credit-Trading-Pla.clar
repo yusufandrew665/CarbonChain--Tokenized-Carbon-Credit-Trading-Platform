@@ -3,11 +3,15 @@
 (define-constant err-not-verified (err u101))
 (define-constant err-invalid-amount (err u102))
 (define-constant err-unauthorized (err u103))
+(define-constant err-insufficient-balance (err u104))
+(define-constant err-invalid-retirement (err u105))
 
 ;; Define data variables
 (define-data-var total-credits uint u0)
 (define-data-var verification-threshold uint u1000)
 (define-data-var credit-price uint u100)
+(define-data-var total-retired uint u0)
+(define-data-var retirement-certificate-counter uint u0)
 
 ;; Define data maps
 (define-map credit-balances
@@ -30,6 +34,20 @@
 (define-map pending-verifications
     uint
     bool
+)
+(define-map retirement-certificates
+    uint
+    {
+        retirer: principal,
+        amount: uint,
+        timestamp: uint,
+        purpose: (string-ascii 100),
+        organization: (optional (string-ascii 50)),
+    }
+)
+(define-map user-retirement-totals
+    principal
+    uint
 )
 
 (define-fungible-token carbon-credits)
@@ -77,6 +95,70 @@
         (asserts! (> amount u0) err-invalid-amount)
         (try! (ft-burn? carbon-credits amount tx-sender))
         (ok true)
+    )
+)
+
+;; Retirement Functions
+(define-public (retire-credits
+        (amount uint)
+        (purpose (string-ascii 100))
+        (organization (optional (string-ascii 50)))
+    )
+    (let (
+            (current-balance (ft-get-balance carbon-credits tx-sender))
+            (certificate-id (+ (var-get retirement-certificate-counter) u1))
+            (current-user-total (default-to u0 (map-get? user-retirement-totals tx-sender)))
+        )
+        (begin
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= current-balance amount) err-insufficient-balance)
+            (try! (ft-burn? carbon-credits amount tx-sender))
+            (map-set retirement-certificates certificate-id {
+                retirer: tx-sender,
+                amount: amount,
+                timestamp: burn-block-height,
+                purpose: purpose,
+                organization: organization,
+            })
+            (map-set user-retirement-totals tx-sender
+                (+ current-user-total amount)
+            )
+            (var-set total-retired (+ (var-get total-retired) amount))
+            (var-set retirement-certificate-counter certificate-id)
+            (ok certificate-id)
+        )
+    )
+)
+
+(define-public (retire-credits-for-organization
+        (amount uint)
+        (purpose (string-ascii 100))
+        (organization (string-ascii 50))
+        (beneficiary principal)
+    )
+    (let (
+            (current-balance (ft-get-balance carbon-credits tx-sender))
+            (certificate-id (+ (var-get retirement-certificate-counter) u1))
+            (current-user-total (default-to u0 (map-get? user-retirement-totals beneficiary)))
+        )
+        (begin
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= current-balance amount) err-insufficient-balance)
+            (try! (ft-burn? carbon-credits amount tx-sender))
+            (map-set retirement-certificates certificate-id {
+                retirer: beneficiary,
+                amount: amount,
+                timestamp: burn-block-height,
+                purpose: purpose,
+                organization: (some organization),
+            })
+            (map-set user-retirement-totals beneficiary
+                (+ current-user-total amount)
+            )
+            (var-set total-retired (+ (var-get total-retired) amount))
+            (var-set retirement-certificate-counter certificate-id)
+            (ok certificate-id)
+        )
     )
 )
 
@@ -174,5 +256,35 @@
         (asserts! (is-contract-owner tx-sender) err-owner-only)
         (var-set verification-threshold new-threshold)
         (ok true)
+    )
+)
+
+;; Retirement Read-Only Functions
+(define-read-only (get-retirement-certificate (certificate-id uint))
+    (map-get? retirement-certificates certificate-id)
+)
+
+(define-read-only (get-user-retirement-total (user principal))
+    (default-to u0 (map-get? user-retirement-totals user))
+)
+
+(define-read-only (get-total-retired)
+    (var-get total-retired)
+)
+
+(define-read-only (get-retirement-certificate-count)
+    (var-get retirement-certificate-counter)
+)
+
+(define-read-only (get-retirement-stats)
+    (let ((total-supply (ft-get-supply carbon-credits)))
+        (ok {
+            total-retired: (var-get total-retired),
+            total-certificates: (var-get retirement-certificate-counter),
+            retirement-percentage: (if (> total-supply u0)
+                (/ (* (var-get total-retired) u10000) total-supply)
+                u0
+            ),
+        })
     )
 )
