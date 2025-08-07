@@ -5,6 +5,9 @@
 (define-constant err-unauthorized (err u103))
 (define-constant err-insufficient-balance (err u104))
 (define-constant err-invalid-retirement (err u105))
+(define-constant err-insufficient-staked (err u106))
+(define-constant err-stake-locked (err u107))
+(define-constant err-no-stake (err u108))
 
 ;; Define data variables
 (define-data-var total-credits uint u0)
@@ -12,6 +15,8 @@
 (define-data-var credit-price uint u100)
 (define-data-var total-retired uint u0)
 (define-data-var retirement-certificate-counter uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var stake-reward-rate uint u5)
 
 ;; Define data maps
 (define-map credit-balances
@@ -48,6 +53,14 @@
 (define-map user-retirement-totals
     principal
     uint
+)
+(define-map user-stakes
+    principal
+    {
+        amount: uint,
+        start-block: uint,
+        lock-period: uint,
+    }
 )
 
 (define-fungible-token carbon-credits)
@@ -162,6 +175,60 @@
     )
 )
 
+;; Staking Functions
+(define-public (stake-credits
+        (amount uint)
+        (lock-blocks uint)
+    )
+    (let (
+            (current-balance (ft-get-balance carbon-credits tx-sender))
+            (existing-stake (map-get? user-stakes tx-sender))
+        )
+        (begin
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (>= current-balance amount) err-insufficient-balance)
+            (asserts! (is-none existing-stake) err-stake-locked)
+            (try! (ft-transfer? carbon-credits amount tx-sender (as-contract tx-sender)))
+            (map-set user-stakes tx-sender {
+                amount: amount,
+                start-block: burn-block-height,
+                lock-period: lock-blocks,
+            })
+            (var-set total-staked (+ (var-get total-staked) amount))
+            (ok true)
+        )
+    )
+)
+
+(define-public (unstake-credits)
+    (let (
+            (stake-info (unwrap! (map-get? user-stakes tx-sender) err-no-stake))
+            (stake-amount (get amount stake-info))
+            (start-block (get start-block stake-info))
+            (lock-period (get lock-period stake-info))
+            (blocks-staked (- burn-block-height start-block))
+            (reward-amount (calculate-stake-reward stake-amount blocks-staked))
+        )
+        (begin
+            (asserts! (>= blocks-staked lock-period) err-stake-locked)
+            (try! (ft-transfer? carbon-credits stake-amount (as-contract tx-sender)
+                tx-sender
+            ))
+            (try! (ft-mint? carbon-credits reward-amount tx-sender))
+            (map-delete user-stakes tx-sender)
+            (var-set total-staked (- (var-get total-staked) stake-amount))
+            (ok reward-amount)
+        )
+    )
+)
+
+(define-private (calculate-stake-reward
+        (amount uint)
+        (blocks-staked uint)
+    )
+    (/ (* amount blocks-staked (var-get stake-reward-rate)) u10000)
+)
+
 ;; Marketplace Functions
 (define-public (list-credits-for-sale
         (amount uint)
@@ -205,6 +272,14 @@
     (begin
         (asserts! (is-contract-owner tx-sender) err-owner-only)
         (var-set credit-price new-price)
+        (ok true)
+    )
+)
+
+(define-public (update-stake-reward-rate (new-rate uint))
+    (begin
+        (asserts! (is-contract-owner tx-sender) err-owner-only)
+        (var-set stake-reward-rate new-rate)
         (ok true)
     )
 )
@@ -286,5 +361,30 @@
                 u0
             ),
         })
+    )
+)
+
+(define-read-only (get-stake-info (user principal))
+    (map-get? user-stakes user)
+)
+
+(define-read-only (get-total-staked)
+    (var-get total-staked)
+)
+
+(define-read-only (get-stake-reward-rate)
+    (var-get stake-reward-rate)
+)
+
+(define-read-only (calculate-current-rewards (user principal))
+    (match (map-get? user-stakes user)
+        stake-info (let (
+                (stake-amount (get amount stake-info))
+                (start-block (get start-block stake-info))
+                (blocks-staked (- burn-block-height start-block))
+            )
+            (ok (calculate-stake-reward stake-amount blocks-staked))
+        )
+        (ok u0)
     )
 )
