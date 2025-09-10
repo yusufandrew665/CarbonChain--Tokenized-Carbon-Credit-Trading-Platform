@@ -60,6 +60,7 @@
         amount: uint,
         start-block: uint,
         lock-period: uint,
+        last-reward-block: uint,
     }
 )
 
@@ -193,6 +194,7 @@
                 amount: amount,
                 start-block: burn-block-height,
                 lock-period: lock-blocks,
+                last-reward-block: burn-block-height,
             })
             (var-set total-staked (+ (var-get total-staked) amount))
             (ok true)
@@ -206,17 +208,41 @@
             (stake-amount (get amount stake-info))
             (start-block (get start-block stake-info))
             (lock-period (get lock-period stake-info))
-            (blocks-staked (- burn-block-height start-block))
-            (reward-amount (calculate-stake-reward stake-amount blocks-staked))
+            (last-reward-block (get last-reward-block stake-info))
+            (blocks-locked (- burn-block-height start-block))
+            (blocks-for-reward (- burn-block-height last-reward-block))
+            (reward-amount (calculate-stake-reward stake-amount blocks-for-reward))
         )
         (begin
-            (asserts! (>= blocks-staked lock-period) err-stake-locked)
+            (asserts! (>= blocks-locked lock-period) err-stake-locked)
             (try! (ft-transfer? carbon-credits stake-amount (as-contract tx-sender)
                 tx-sender
             ))
             (try! (ft-mint? carbon-credits reward-amount tx-sender))
             (map-delete user-stakes tx-sender)
             (var-set total-staked (- (var-get total-staked) stake-amount))
+            (ok reward-amount)
+        )
+    )
+)
+
+(define-public (claim-staking-rewards)
+    (let (
+            (stake-info (unwrap! (map-get? user-stakes tx-sender) err-no-stake))
+            (last-reward-block (get last-reward-block stake-info))
+            (current-block burn-block-height)
+            (blocks-elapsed (- current-block last-reward-block))
+            (stake-amount (get amount stake-info))
+            (reward-amount (if (> blocks-elapsed u0)
+                (calculate-stake-reward stake-amount blocks-elapsed)
+                u0
+            ))
+        )
+        (begin
+            (try! (ft-mint? carbon-credits reward-amount tx-sender))
+            (map-set user-stakes tx-sender
+                (merge stake-info { last-reward-block: current-block })
+            )
             (ok reward-amount)
         )
     )
@@ -380,8 +406,8 @@
     (match (map-get? user-stakes user)
         stake-info (let (
                 (stake-amount (get amount stake-info))
-                (start-block (get start-block stake-info))
-                (blocks-staked (- burn-block-height start-block))
+                (last-reward-block (get last-reward-block stake-info))
+                (blocks-staked (- burn-block-height last-reward-block))
             )
             (ok (calculate-stake-reward stake-amount blocks-staked))
         )
