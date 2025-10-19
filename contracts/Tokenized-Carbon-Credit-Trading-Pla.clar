@@ -8,6 +8,9 @@
 (define-constant err-insufficient-staked (err u106))
 (define-constant err-stake-locked (err u107))
 (define-constant err-no-stake (err u108))
+(define-constant err-invalid-audit-data (err u109))
+(define-constant err-audit-not-found (err u110))
+(define-constant err-unauthorized-auditor (err u111))
 
 ;; Define data variables
 (define-data-var total-credits uint u0)
@@ -17,6 +20,8 @@
 (define-data-var retirement-certificate-counter uint u0)
 (define-data-var total-staked uint u0)
 (define-data-var stake-reward-rate uint u5)
+(define-data-var audit-log-counter uint u0)
+(define-data-var provenance-counter uint u0)
 
 ;; Define data maps
 (define-map credit-balances
@@ -62,6 +67,48 @@
         lock-period: uint,
         last-reward-block: uint,
     }
+)
+(define-map audit-logs
+    uint
+    {
+        credit-id: uint,
+        activity-type: (string-ascii 50),
+        actor: principal,
+        amount: uint,
+        timestamp: uint,
+        details: (string-ascii 200),
+        transaction-hash: (buff 32),
+    }
+)
+(define-map credit-provenance
+    uint
+    {
+        project-name: (string-ascii 100),
+        location: (string-ascii 100),
+        certification-body: (string-ascii 50),
+        methodology: (string-ascii 50),
+        vintage-year: uint,
+        co2-amount: uint,
+        verification-date: uint,
+        additional-standards: (list 5 (string-ascii 30)),
+    }
+)
+(define-map impact-verification
+    uint
+    {
+        credit-id: uint,
+        impact-type: (string-ascii 50),
+        measurement-value: uint,
+        unit: (string-ascii 20),
+        verifier: principal,
+        verification-date: uint,
+        evidence-hash: (buff 32),
+        confidence-level: uint,
+    }
+)
+(define-map authorized-auditors
+    principal
+    bool
 )
 
 (define-fungible-token carbon-credits)
@@ -255,6 +302,104 @@
     (/ (* amount blocks-staked (var-get stake-reward-rate)) u10000)
 )
 
+;; Audit Trail Functions
+(define-public (log-credit-activity
+        (credit-id uint)
+        (activity-type (string-ascii 50))
+        (amount uint)
+        (details (string-ascii 200))
+        (tx-hash (buff 32))
+    )
+    (let ((log-id (+ (var-get audit-log-counter) u1)))
+        (begin
+            (asserts! (> credit-id u0) err-invalid-audit-data)
+            (asserts! (> (len activity-type) u0) err-invalid-audit-data)
+            (map-set audit-logs log-id {
+                credit-id: credit-id,
+                activity-type: activity-type,
+                actor: tx-sender,
+                amount: amount,
+                timestamp: burn-block-height,
+                details: details,
+                transaction-hash: tx-hash,
+            })
+            (var-set audit-log-counter log-id)
+            (ok log-id)
+        )
+    )
+)
+
+(define-public (add-provenance-data
+        (credit-id uint)
+        (project-name (string-ascii 100))
+        (location (string-ascii 100))
+        (certification-body (string-ascii 50))
+        (methodology (string-ascii 50))
+        (vintage-year uint)
+        (co2-amount uint)
+        (additional-standards (list 5 (string-ascii 30)))
+    )
+    (let ((provenance-id (+ (var-get provenance-counter) u1)))
+        (begin
+            (asserts! (is-authorized-auditor tx-sender) err-unauthorized-auditor)
+            (asserts! (> credit-id u0) err-invalid-audit-data)
+            (asserts! (> (len project-name) u0) err-invalid-audit-data)
+            (asserts! (> co2-amount u0) err-invalid-audit-data)
+            (asserts! (> vintage-year u1990) err-invalid-audit-data)
+            (map-set credit-provenance provenance-id {
+                project-name: project-name,
+                location: location,
+                certification-body: certification-body,
+                methodology: methodology,
+                vintage-year: vintage-year,
+                co2-amount: co2-amount,
+                verification-date: burn-block-height,
+                additional-standards: additional-standards,
+            })
+            (var-set provenance-counter provenance-id)
+            (try! (log-credit-activity credit-id "PROVENANCE_ADDED" co2-amount
+                (concat "Provenance data added for project: " project-name)
+                0x0000000000000000000000000000000000000000000000000000000000000000
+            ))
+            (ok provenance-id)
+        )
+    )
+)
+
+(define-public (record-impact-metrics
+        (credit-id uint)
+        (impact-type (string-ascii 50))
+        (measurement-value uint)
+        (unit (string-ascii 20))
+        (evidence-hash (buff 32))
+        (confidence-level uint)
+    )
+    (let ((impact-id (+ credit-id (* u1000000 burn-block-height))))
+        (begin
+            (asserts! (is-authorized-auditor tx-sender) err-unauthorized-auditor)
+            (asserts! (> credit-id u0) err-invalid-audit-data)
+            (asserts! (> (len impact-type) u0) err-invalid-audit-data)
+            (asserts! (> measurement-value u0) err-invalid-audit-data)
+            (asserts! (<= confidence-level u100) err-invalid-audit-data)
+            (map-set impact-verification impact-id {
+                credit-id: credit-id,
+                impact-type: impact-type,
+                measurement-value: measurement-value,
+                unit: unit,
+                verifier: tx-sender,
+                verification-date: burn-block-height,
+                evidence-hash: evidence-hash,
+                confidence-level: confidence-level,
+            })
+            (try! (log-credit-activity credit-id "IMPACT_RECORDED" measurement-value
+                (concat "Impact metrics recorded: " impact-type)
+                evidence-hash
+            ))
+            (ok impact-id)
+        )
+    )
+)
+
 ;; Marketplace Functions
 (define-public (list-credits-for-sale
         (amount uint)
@@ -306,6 +451,17 @@
     (begin
         (asserts! (is-contract-owner tx-sender) err-owner-only)
         (var-set stake-reward-rate new-rate)
+        (ok true)
+    )
+)
+
+(define-public (set-authorized-auditor
+        (address principal)
+        (authorized bool)
+    )
+    (begin
+        (asserts! (is-contract-owner tx-sender) err-owner-only)
+        (map-set authorized-auditors address authorized)
         (ok true)
     )
 )
@@ -413,4 +569,66 @@
         )
         (ok u0)
     )
+)
+
+;; Audit Trail Read-Only Functions
+(define-read-only (get-audit-log (log-id uint))
+    (map-get? audit-logs log-id)
+)
+
+(define-read-only (get-audit-trail-summary (credit-id uint))
+    (ok {
+        credit-id: credit-id,
+        total-logs: (var-get audit-log-counter),
+        message: "Use get-audit-log with specific log IDs to retrieve individual entries"
+    })
+)
+
+(define-read-only (get-provenance-data (provenance-id uint))
+    (map-get? credit-provenance provenance-id)
+)
+
+(define-read-only (get-impact-verification (impact-id uint))
+    (map-get? impact-verification impact-id)
+)
+
+(define-read-only (is-authorized-auditor (address principal))
+    (default-to false (map-get? authorized-auditors address))
+)
+
+(define-read-only (get-audit-log-count)
+    (var-get audit-log-counter)
+)
+
+(define-read-only (get-provenance-count)
+    (var-get provenance-counter)
+)
+
+(define-read-only (generate-compliance-report (credit-id uint))
+    (match (map-get? credit-metadata credit-id)
+        credit-info (ok {
+            credit-id: credit-id,
+            owner: (get owner credit-info),
+            amount: (get amount credit-info),
+            verified: (get verified credit-info),
+            created-at: (get timestamp credit-info),
+            total-system-logs: (var-get audit-log-counter),
+            report-generated-at: burn-block-height,
+            compliance-status: (if (get verified credit-info) "VERIFIED" "PENDING"),
+        })
+        err-audit-not-found
+    )
+)
+
+(define-read-only (get-audit-statistics)
+    (ok {
+        total-audit-logs: (var-get audit-log-counter),
+        total-provenance-records: (var-get provenance-counter),
+        total-credits: (var-get total-credits),
+        total-retired: (var-get total-retired),
+        audit-coverage-percentage: (if (> (var-get total-credits) u0)
+            (/ (* (var-get audit-log-counter) u100) (var-get total-credits))
+            u0
+        ),
+    })
 )
