@@ -11,6 +11,8 @@
 (define-constant err-invalid-audit-data (err u109))
 (define-constant err-audit-not-found (err u110))
 (define-constant err-unauthorized-auditor (err u111))
+(define-constant err-inactive-order (err u112))
+(define-constant err-order-not-found (err u113))
 
 ;; Define data variables
 (define-data-var total-credits uint u0)
@@ -22,6 +24,7 @@
 (define-data-var stake-reward-rate uint u5)
 (define-data-var audit-log-counter uint u0)
 (define-data-var provenance-counter uint u0)
+(define-data-var sell-order-counter uint u0)
 
 ;; Define data maps
 (define-map credit-balances
@@ -109,6 +112,16 @@
 (define-map authorized-auditors
     principal
     bool
+)
+(define-map sell-orders
+    uint
+    {
+        seller: principal,
+        price: uint,
+        remaining: uint,
+        created-at: uint,
+        is-active: bool,
+    }
 )
 
 (define-fungible-token carbon-credits)
@@ -427,6 +440,116 @@
     )
 )
 
+(define-public (create-sell-order
+        (amount uint)
+        (price uint)
+    )
+    (let ((order-id (+ (var-get sell-order-counter) u1)))
+        (begin
+            (asserts! (> amount u0) err-invalid-amount)
+            (asserts! (> price u0) err-invalid-amount)
+            (try! (ft-transfer? carbon-credits amount tx-sender (as-contract tx-sender)))
+            (map-set sell-orders order-id {
+                seller: tx-sender,
+                price: price,
+                remaining: amount,
+                created-at: burn-block-height,
+                is-active: true,
+            })
+            (var-set sell-order-counter order-id)
+            (ok order-id)
+        )
+    )
+)
+
+(define-public (fill-sell-order
+        (order-id uint)
+        (amount uint)
+    )
+    (let ((order-optional (map-get? sell-orders order-id)))
+        (match order-optional
+            order (let (
+                    (remaining (get remaining order))
+                    (price (get price order))
+                    (seller (get seller order))
+                    (is-active (get is-active order))
+                    (purchase-amount amount)
+                    (total-cost (* amount price))
+                )
+                (begin
+                    (asserts! is-active err-inactive-order)
+                    (asserts! (> purchase-amount u0) err-invalid-amount)
+                    (asserts! (<= purchase-amount remaining)
+                        err-insufficient-balance
+                    )
+                    (try! (stx-transfer? total-cost tx-sender seller))
+                    (try! (ft-transfer? carbon-credits purchase-amount
+                        (as-contract tx-sender) tx-sender
+                    ))
+                    (let ((new-remaining (- remaining purchase-amount)))
+                        (if (> new-remaining u0)
+                            (begin
+                                (map-set sell-orders order-id
+                                    (merge order { remaining: new-remaining })
+                                )
+                                (ok purchase-amount)
+                            )
+                            (begin
+                                (map-set sell-orders order-id
+                                    (merge order {
+                                        remaining: u0,
+                                        is-active: false,
+                                    })
+                                )
+                                (ok purchase-amount)
+                            )
+                        )
+                    )
+                )
+            )
+            err-order-not-found
+        )
+    )
+)
+
+(define-public (cancel-sell-order (order-id uint))
+    (let (
+            (order (unwrap! (map-get? sell-orders order-id) err-order-not-found))
+            (seller (get seller order))
+            (remaining (get remaining order))
+            (is-active (get is-active order))
+        )
+        (begin
+            (asserts! (is-eq tx-sender seller) err-unauthorized)
+            (asserts! is-active err-inactive-order)
+            (if (> remaining u0)
+                (begin
+                    (try! (ft-transfer? carbon-credits remaining
+                        (as-contract tx-sender) seller
+                    ))
+                    true
+                )
+                true
+            )
+            (map-set sell-orders order-id
+                (merge order {
+                    remaining: u0,
+                    is-active: false,
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-sell-order (order-id uint))
+    (map-get? sell-orders order-id)
+)
+
+(define-read-only (get-sell-order-count)
+    (var-get sell-order-counter)
+)
+
 ;; Admin Functions
 (define-public (set-verifier
         (address principal)
@@ -580,7 +703,7 @@
     (ok {
         credit-id: credit-id,
         total-logs: (var-get audit-log-counter),
-        message: "Use get-audit-log with specific log IDs to retrieve individual entries"
+        message: "Use get-audit-log with specific log IDs to retrieve individual entries",
     })
 )
 
@@ -614,7 +737,10 @@
             created-at: (get timestamp credit-info),
             total-system-logs: (var-get audit-log-counter),
             report-generated-at: burn-block-height,
-            compliance-status: (if (get verified credit-info) "VERIFIED" "PENDING"),
+            compliance-status: (if (get verified credit-info)
+                "VERIFIED"
+                "PENDING"
+            ),
         })
         err-audit-not-found
     )
